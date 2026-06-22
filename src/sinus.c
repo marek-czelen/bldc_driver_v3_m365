@@ -13,7 +13,8 @@
  *     → interpolacja liniowa z ostatnio zmierzonego okresu 60°.
  *   - Advance 60°: kąt wysterowania = kąt wirnika + 60°.
  *   - Midpoint injection (SVPWM) na surowych wartościach sinusa.
- *   - Tabela sin3_table: sin + 1/6·sin(3θ), znormalizowana do 100..1900.
+ *   - Tabela sin3_table: sin + 1/6·sin(3θ), znormalizowana do 100..1900 (ARR=2000).
+ *     Przeskalowywana w locie do aktualnego PWM_ARR.
  */
 
 /* ── Tabela sinusa + 3. harmonicznej ─────────────────────────── */
@@ -234,10 +235,11 @@ void sinus_update(void)
     uint8_t idx_b = (uint8_t)((adv + 43691U) >> 8);   /* -120° ≡ +240° */
     uint8_t idx_c = (uint8_t)((adv + 21845U) >> 8);   /* -240° ≡ +120° */
 
-    /* Surowe wartości z tabeli (100..1900, środek 1000). */
-    int16_t sa = (int16_t)(sin3_table[idx_a]) - 1000;
-    int16_t sb = (int16_t)(sin3_table[idx_b]) - 1000;
-    int16_t sc = (int16_t)(sin3_table[idx_c]) - 1000;
+    /* Surowe wartości z tabeli (znormalizowane do ARR=2000), przeskaluj do PWM_ARR. */
+    int16_t mid_ref = (int16_t)(PWM_ARR / 2U);
+    int16_t sa = (int16_t)(((uint32_t)sin3_table[idx_a] * PWM_ARR) / 2000U) - mid_ref;
+    int16_t sb = (int16_t)(((uint32_t)sin3_table[idx_b] * PWM_ARR) / 2000U) - mid_ref;
+    int16_t sc = (int16_t)(((uint32_t)sin3_table[idx_c] * PWM_ARR) / 2000U) - mid_ref;
 
     /* ── Midpoint injection (SVPWM) ── */
     int16_t vmin = sa, vmax = sa;
@@ -256,19 +258,24 @@ void sinus_update(void)
 
     /* Mapowanie do CCR:
      * CCR = PWM_ARR/2 + (sa/500) × swing × modulation
-     * swing = PWM_ARR/2 - 100 (margines 5%) */
+     * swing = PWM_ARR/2 * 0.9 (90% margines) */
     int32_t mid   = (int32_t)(PWM_ARR / 2U);
-    int32_t swing = mid - 100;
+    int32_t swing = (mid * 9) / 10;
     int32_t mod_i = (int32_t)(s_modulation * 1000.0f);   /* 0..1000 */
 
     int32_t ccr_a = mid + ((swing * mod_i / 1000) * sa / 500);
     int32_t ccr_b = mid + ((swing * mod_i / 1000) * sb / 500);
     int32_t ccr_c = mid + ((swing * mod_i / 1000) * sc / 500);
 
-    /* Clamp. */
-    if (ccr_a < 100) ccr_a = 100;  if (ccr_a > 1900) ccr_a = 1900;
-    if (ccr_b < 100) ccr_b = 100;  if (ccr_b > 1900) ccr_b = 1900;
-    if (ccr_c < 100) ccr_c = 100;  if (ccr_c > 1900) ccr_c = 1900;
+    /* Clamp do 5%..95% PWM_ARR. */
+    int32_t ccr_min = (int32_t)(PWM_ARR / 20U);
+    int32_t ccr_max = (int32_t)(PWM_ARR - ccr_min);
+    if (ccr_a < ccr_min) ccr_a = ccr_min;
+    if (ccr_a > ccr_max) ccr_a = ccr_max;
+    if (ccr_b < ccr_min) ccr_b = ccr_min;
+    if (ccr_b > ccr_max) ccr_b = ccr_max;
+    if (ccr_c < ccr_min) ccr_c = ccr_min;
+    if (ccr_c > ccr_max) ccr_c = ccr_max;
 
     TIM1->CCR1 = (uint16_t)ccr_a;
     TIM1->CCR2 = (uint16_t)ccr_b;

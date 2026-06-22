@@ -31,9 +31,9 @@
 /* PWM / TIM1 (mostek 3-fazowy, wyjścia komplementarne)               */
 /* ------------------------------------------------------------------ */
 /* f_pwm = SYSCLK / (2 * ARR)  -> center-aligned                      */
-#define PWM_ARR            2000U        /* 64MHz/(2*2000) = 16 kHz   */
-#define PWM_FREQ_HZ        16000U
-#define PWM_DUTY_MAX       1900U        /* 95% (rezerwa na bootstrap)*/
+#define PWM_ARR            1600U        /* 64MHz/(2*1600) = 20 kHz   */
+#define PWM_FREQ_HZ        20000U
+#define PWM_DUTY_MAX       1520U        /* 95% (rezerwa na bootstrap)*/
 #define PWM_DEADTIME_REG   64U          /* ~1 us przy 64 MHz         */
 
 /* Wyjścia PWM high-side: PA8/PA9/PA10 (TIM1_CH1/2/3)                  */
