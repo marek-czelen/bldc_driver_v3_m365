@@ -243,3 +243,8 @@ uint16_t sinus_get_angle(void)
 {
     return s_angle;
 }
+
+bool sinus_is_running(void)
+{
+    return s_running;
+}

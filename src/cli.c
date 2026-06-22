@@ -49,11 +49,15 @@ static void cmd_help(void)
 
 static void cmd_status(void)
 {
-    uart_printf("st=%d md=%d dir=%d ct=%d h=%u d=%d rpm=%d\r\n",
+    int16_t ia = adc_read_current_ma(ADC_CH_IA);
+    int16_t ib = adc_read_current_ma(ADC_CH_IB);
+    int16_t ic = adc_read_current_ma(ADC_CH_IC);
+    uart_printf("st=%d md=%d dir=%d ct=%d h=%u d=%d rpm=%d ia=%d ib=%d ic=%d\r\n",
         (int)motor_get_state(), (int)motor_get_mode(),
         (int)motor_get_dir(), (int)motor_get_ctrl(),
         (unsigned)motor_get_hall(), (int)motor_get_duty_pct(),
-        (int)motor_get_rpm());
+        (int)motor_get_rpm(),
+        (int)ia, (int)ib, (int)ic);
 }
 
 static void cmd_analog(void)

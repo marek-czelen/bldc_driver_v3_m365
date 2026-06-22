@@ -23,5 +23,6 @@ void sinus_update(void);
 float  sinus_get_rpm(void);        /* RPM mechaniczne */
 float  sinus_get_amplitude(void);  /* aktualna amplituda % */
 uint16_t sinus_get_angle(void);    /* kąt elektryczny 0..65535 (0..360°) */
+bool sinus_is_running(void);
 
 #endif /* SINUS_H */

@@ -61,7 +61,11 @@
 
 /* Skalowania (DOSTOSUJ do dzielnika napięcia / czujnika prądu).     */
 #define VBAT_MV_PER_COUNT  10.0f   /* placeholder: mV na 1 count ADC */
-#define IPHASE_MA_PER_CNT  5.0f    /* placeholder: mA na 1 count ADC */
+/* Współczynnik konwersji ADC→mA: mA = (offset - raw) * IPHASE_MA_PER_CNT.
+ * Dla M365 (shunt ~10mΩ, wzmacniacz ~50V/V, Vref=3.3V): ~15 mA/count.
+ * Kalibracja: zmierz prąd miernikiem, odczytaj surowy ADC, wylicz.
+ *   IPHASE_MA_PER_CNT = I_zmierzone_mA / |ADC_offset - ADC_obciążenie|   */
+#define IPHASE_MA_PER_CNT  15.0f    /* mA na 1 count ADC (dla M365)  */
 
 /* ------------------------------------------------------------------ */
 /* UART (USART3, PB10 TX / PB11 RX)                                  */

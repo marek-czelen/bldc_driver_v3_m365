@@ -5,6 +5,7 @@
 #include "timebase.h"
 #include "eeprom.h"
 #include "sinus.h"
+#include "adc.h"
 
 /* ------------------------------------------------------------------ */
 /* Tablice komutacji 6-step (indeks = stan Halla 0..7).               */
@@ -104,6 +105,9 @@ void motor_init(void)
     motor_config_load();
     sinus_init();
     pwm_coast();
+
+    /* Kalibracja offsetu prądu (mostek wyłączony → zero prądu). */
+    adc_calibrate_current_offset();
 }
 
 void motor_start(void)
@@ -113,6 +117,7 @@ void motor_start(void)
         s_state = MSTATE_RUN;
         s_last_hall_us = micros();
         s_hall = hall_read();
+        sinus_set_amplitude(((float)s_duty * 100.0f) / (float)PWM_DUTY_MAX);
         sinus_start();
         return;
     }
@@ -393,6 +398,12 @@ void motor_set_duty_pct(float pct)
     if (s_state == MSTATE_RUN) {
         if (s_mode == MODE_SINUS) {
             sinus_set_amplitude(pct);
+            /* R ma być podtrzymane aż do S:
+             * jeśli SINUS zatrzymał się po timeout Halla (np. po D0),
+             * dodatnie duty ma go ponownie uzbroić bez ponownego R. */
+            if (pct > 0.0f && !sinus_is_running()) {
+                sinus_start();
+            }
         } else {
             hw_commutate(hall_read());
         }
