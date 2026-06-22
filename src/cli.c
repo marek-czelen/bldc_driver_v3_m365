@@ -3,199 +3,204 @@
 #include "motor.h"
 #include "adc.h"
 #include "board.h"
-
 #include <stdlib.h>
-#include <ctype.h>
+
+#define RESP_OK()          uart_write("OK\r\n")
+#define RESP_E(code)       uart_printf("E %s\r\n", (code))
+
+static int parse_int_arg(const char *arg, int *out)
+{
+    char *end = NULL;
+    long v;
+
+    if (arg == NULL || *arg == '\0') return 0;
+    v = strtol(arg, &end, 10);
+    if (end == arg || *end != '\0') return 0;
+    *out = (int)v;
+    return 1;
+}
+
+static int parse_float_arg(const char *arg, float *out)
+{
+    char *end = NULL;
+    float v;
+
+    if (arg == NULL || *arg == '\0') return 0;
+    v = strtof(arg, &end);
+    if (end == arg || *end != '\0') return 0;
+    *out = v;
+    return 1;
+}
 
 /*
- * Krotki protokol (komendy wysylane przez nadrzedny CPU).
- * Format: <litera>[liczba]\n   (biale znaki ignorowane)
- *
- *   R          start (run)
- *   S          stop (wybieg)
- *   B          brake (hamowanie zwarciowe)
- *   D<n>       duty % 0..100        (open-loop)   np. D5
- *   N<n>       zadana predkosc rpm  (closed-loop) np. N300
- *   F<0|1>     kierunek 0=FWD 1=REV
- *   M<0|1>     tryb 0=BLOCK 1=SINUS
- *   V<0..5>    wymuszenie wektora komutacji (kalibracja, open-loop)
- *   L[%]       uczenie sekwencji Halla, np. "L" lub "L25" dla 25% duty
- *   K          zapisz konfiguracje Halla do EEPROM
- *   P          wypisz zapisana konfiguracje (sekwencja Halla)
- *   X          usun zapisana konfiguracje (powrot do domyslnej)
- *   A          odczyt analogowy: vbat,Ia,Ib,Ic (raw ADC)
- *   ?          status (CSV)
- *   H / I      pomoc
- *
- * Odpowiedzi: "OK" / "E" / linia danych.
+ * Protokół: <litera>[argument], terminator CR/LF/CRLF.
+ * Białe znaki po literze ignorowane.
+ * Odpowiedzi: jedna linia na jedną komendę.
  */
 
-static void print_help(void)
+static void cmd_help(void)
 {
-    uart_write(
-        "R start | S stop | B brake\r\n"
-        "D<n> duty% | N<n> rpm | F<0|1> dir | M<0|1> tryb\r\n"
-        "V<0-5> wektor | L[%] ucz-hall | K save | P cfg | X erase\r\n"
-        "A analog | ? status | H pomoc\r\n");
+    uart_write("BLDC v3\r\n"
+        "R start S stop B brake W ping\r\n"
+        "D<n> duty% N<n> rpm F0|1 dir M0|1 tryb\r\n"
+        "V<0-5> wektor L[%%] ucz-hall K save P cfg X erase\r\n"
+    "A analog ? status H help\r\n");
 }
 
-/* status: st,md,dir,ct,hall,duty%,rpm */
-static void print_status(void)
+static void cmd_status(void)
 {
     uart_printf("st=%d md=%d dir=%d ct=%d h=%u d=%d rpm=%d\r\n",
-                (int)motor_get_state(),
-                (int)motor_get_mode(),
-                (int)motor_get_dir(),
-                (int)motor_get_ctrl(),
-                (unsigned)motor_get_hall(),
-                (int)motor_get_duty_pct(),
-                (int)motor_get_rpm());
+        (int)motor_get_state(), (int)motor_get_mode(),
+        (int)motor_get_dir(), (int)motor_get_ctrl(),
+        (unsigned)motor_get_hall(), (int)motor_get_duty_pct(),
+        (int)motor_get_rpm());
 }
 
-static void print_analog(void)
+static void cmd_analog(void)
 {
-    uart_printf("vbat=%u Ia=%u Ib=%u Ic=%u\r\n",
-                (unsigned)adc_read(ADC_CH_VBAT),
-                (unsigned)adc_read(ADC_CH_IA),
-                (unsigned)adc_read(ADC_CH_IB),
-                (unsigned)adc_read(ADC_CH_IC));
+    uart_printf("V=%u A=%u B=%u C=%u\r\n",
+        (unsigned)adc_read(ADC_CH_VBAT),
+        (unsigned)adc_read(ADC_CH_IA),
+        (unsigned)adc_read(ADC_CH_IB),
+        (unsigned)adc_read(ADC_CH_IC));
 }
 
-/* Wypisz zapisaną/aktywną konfigurację Halla. */
-static void print_config(void)
+static void cmd_config(void)
 {
-    uart_printf("hall_seq=%u,%u,%u,%u,%u,%u learned=%d\r\n",
-                motor_get_hall_seq(0), motor_get_hall_seq(1),
-                motor_get_hall_seq(2), motor_get_hall_seq(3),
-                motor_get_hall_seq(4), motor_get_hall_seq(5),
-                motor_is_learned() ? 1 : 0);
-}
-
-static void handle_line(const char *line)
-{
-    while (*line == ' ' || *line == '\t') {
-        line++;
-    }
-    if (*line == '\0') {
-        return;
-    }
-
-    char cmd = (char)toupper((unsigned char)*line);
-    const char *arg = line + 1;
-    while (*arg == ' ' || *arg == '\t') {
-        arg++;
-    }
-
-    switch (cmd) {
-        case 'R':
-            motor_start();
-            uart_write("OK\r\n");
-            break;
-        case 'S':
-            motor_stop();
-            uart_write("OK\r\n");
-            break;
-        case 'B':
-            motor_brake();
-            uart_write("OK\r\n");
-            break;
-        case 'D':
-            if (*arg) {
-                motor_set_duty_pct((float)atof(arg));
-                uart_write("OK\r\n");
-            } else {
-                uart_write("E\r\n");
-            }
-            break;
-        case 'N':
-            if (*arg) {
-                motor_set_target_rpm((float)atof(arg));
-                uart_write("OK\r\n");
-            } else {
-                uart_write("E\r\n");
-            }
-            break;
-        case 'F':
-            if (*arg == '0') {
-                motor_set_dir(DIR_FWD);
-                uart_write("OK\r\n");
-            } else if (*arg == '1') {
-                motor_set_dir(DIR_REV);
-                uart_write("OK\r\n");
-            } else {
-                uart_write("E\r\n");
-            }
-            break;
-        case 'M':
-            if (*arg == '0') {
-                motor_set_mode(MODE_BLOCK);
-                uart_write("OK\r\n");
-            } else if (*arg == '1') {
-                motor_set_mode(MODE_SINUS);
-                uart_write("OK\r\n");
-            } else {
-                uart_write("E\r\n");
-            }
-            break;
-        case 'V':
-            if (*arg) {
-                motor_force_vector((uint8_t)atoi(arg));
-                uart_write("OK\r\n");
-            } else {
-                uart_write("E\r\n");
-            }
-            break;
-        case 'L': {
-            uint8_t seq[6];
-            float dp = 0.0f;
-            if (*arg) {
-                dp = (float)atof(arg);
-            }
-            bool ok = motor_learn_hall_with_duty(dp, seq);
-            uart_printf("%s seq=%u,%u,%u,%u,%u,%u\r\n",
-                        ok ? "OK" : "E",
-                        seq[0], seq[1], seq[2], seq[3], seq[4], seq[5]);
-            break;
-        }
-        case 'K':
-            if (motor_config_save()) {
-                uart_write("OK\r\n");
-            } else {
-                uart_write("E\r\n");
-            }
-            break;
-        case 'P':
-            print_config();
-            break;
-        case 'X':
-            motor_config_erase();
-            uart_write("OK\r\n");
-            break;
-        case 'A':
-            print_analog();
-            break;
-        case '?':
-            print_status();
-            break;
-        case 'H':
-        case 'I':
-            print_help();
-            break;
-        default:
-            uart_write("E\r\n");
-            break;
-    }
+    uart_printf("seq=%u,%u,%u,%u,%u,%u ok=%d\r\n",
+        motor_get_hall_seq(0), motor_get_hall_seq(1),
+        motor_get_hall_seq(2), motor_get_hall_seq(3),
+        motor_get_hall_seq(4), motor_get_hall_seq(5),
+        motor_is_learned() ? 1 : 0);
 }
 
 void cli_init(void)
 {
-    uart_write("BLDC v3 BLOCK\r\n");
+    cmd_help();
 }
 
 void cli_process(void)
 {
-    char line[64];
-    if (uart_get_line(line, sizeof(line))) {
-        handle_line(line);
+    char buf[96];
+    uint32_t uerr;
+    if (!uart_get_line(buf, sizeof(buf))) return;
+    if (buf[0] == '\0') return;
+
+    uerr = uart_get_and_clear_errors();
+    if (uerr != 0U) {
+        uart_printf("E UART %lu\r\n", (unsigned long)uerr);
+        return;
+    }
+
+    char  cmd = buf[0];
+    /* Normalizuj do uppercase (małe litery → duże). */
+    if (cmd >= 'a' && cmd <= 'z') cmd -= ('a' - 'A');
+
+    char *arg = buf + 1;
+    while (*arg == ' ' || *arg == '\t') arg++;
+
+    switch (cmd) {
+    /* ── Podstawowe ── */
+    case 'R':
+        if (motor_get_state() == MSTATE_FAULT) motor_stop();
+        motor_start();
+        RESP_OK();
+        break;
+    case 'S':
+        motor_stop();
+        RESP_OK();
+        break;
+    case 'B':
+        motor_brake();
+        RESP_OK();
+        break;
+    case 'W':
+        RESP_OK();
+        break;
+    case '?':
+        cmd_status();
+        break;
+    case 'H':
+        cmd_help();
+        break;
+
+    /* ── Nastawy ── */
+    case 'D': {
+        float v;
+        if (!parse_float_arg(arg, &v)) { RESP_E("ARG"); break; }
+        if (v < 0.0f || v > 100.0f)     { RESP_E("RANGE"); break; }
+        motor_set_duty_pct(v);
+        RESP_OK();
+        break;
+    }
+    case 'N': {
+        float v;
+        if (!parse_float_arg(arg, &v)) { RESP_E("ARG"); break; }
+        if (v < 0.0f)                  { RESP_E("RANGE"); break; }
+        motor_set_target_rpm(v);
+        RESP_OK();
+        break;
+    }
+    case 'F': {
+        int v;
+        if (!parse_int_arg(arg, &v))   { RESP_E("ARG"); break; }
+        if (!(v == 0 || v == 1))       { RESP_E("RANGE"); break; }
+        motor_set_dir((v == 1) ? DIR_REV : DIR_FWD);
+        RESP_OK();
+        break;
+    }
+    case 'M': {
+        int v;
+        if (!parse_int_arg(arg, &v))   { RESP_E("ARG"); break; }
+        if (!(v == 0 || v == 1))       { RESP_E("RANGE"); break; }
+        motor_set_mode((v == 1) ? MODE_SINUS : MODE_BLOCK);
+        RESP_OK();
+        break;
+    }
+
+    /* ── Kalibracja / konfiguracja ── */
+    case 'V': {
+        int v;
+        if (!parse_int_arg(arg, &v))   { RESP_E("ARG"); break; }
+        if (v < 0 || v > 5)            { RESP_E("RANGE"); break; }
+        motor_force_vector((uint8_t)v);
+        RESP_OK();
+        break;
+    }
+    case 'L': {
+        float pct = 0.0f;
+        uint8_t seq[6];
+        if (*arg != '\0' && !parse_float_arg(arg, &pct)) {
+            RESP_E("ARG");
+            break;
+        }
+        if (pct < 0.0f || pct > 100.0f) {
+            RESP_E("RANGE");
+            break;
+        }
+        bool ok = motor_learn_hall_with_duty(pct, seq);
+        uart_printf("%s %u,%u,%u,%u,%u,%u\r\n", ok ? "OK" : "E LEARN",
+            seq[0], seq[1], seq[2], seq[3], seq[4], seq[5]);
+        break;
+    }
+    case 'K':
+        if (motor_config_save()) RESP_OK(); else RESP_E("SAVE");
+        break;
+    case 'P':
+        cmd_config();
+        break;
+    case 'X':
+        motor_config_erase();
+        RESP_OK();
+        break;
+
+    /* ── Pomiary ── */
+    case 'A':
+        cmd_analog();
+        break;
+
+    default:
+        RESP_E("CMD");
+        break;
     }
 }

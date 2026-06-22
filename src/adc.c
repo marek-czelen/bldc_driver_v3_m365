@@ -35,7 +35,13 @@ uint16_t adc_read(uint32_t channel)
     LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_1, channel);
 
     LL_ADC_REG_StartConversionSWStart(ADC1);
+
+    /* Timeout: max ~100k iteracji (≈1 ms przy 64 MHz) — bezpiecznik. */
+    uint32_t timeout = 100000UL;
     while (!LL_ADC_IsActiveFlag_EOS(ADC1)) {
+        if (--timeout == 0) {
+            break;
+        }
     }
     uint16_t v = LL_ADC_REG_ReadConversionData12(ADC1);
     LL_ADC_ClearFlag_EOS(ADC1);
