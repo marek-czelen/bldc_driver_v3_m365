@@ -1,31 +1,90 @@
 #include "pwm.h"
 #include "board.h"
 
-/* Maski kanałów (high + complementary low) dla każdej fazy. */
-static const uint32_t k_ch[3]  = { LL_TIM_CHANNEL_CH1,  LL_TIM_CHANNEL_CH2,  LL_TIM_CHANNEL_CH3  };
-static const uint32_t k_chn[3] = { LL_TIM_CHANNEL_CH1N, LL_TIM_CHANNEL_CH2N, LL_TIM_CHANNEL_CH3N };
+/*
+ * Architektura sprzętowa komutacji:
+ *
+ * TIM1 działa w trybie center-aligned PWM z CCPC=1 (Capture/Compare
+ * Preload Control). Oznacza to, że rejestry CCER i CCRx są buforowane —
+ * zapis do nich trafia do rejestru cienia (preload), a faktyczne
+ * przełączenie następuje DOPIERO przy zdarzeniu COM.
+ *
+ * Dzięki temu ISR Halla może spokojnie wpisać nowe wartości do preloadu
+ * w dowolnym momencie cyklu PWM, a sprzęt przełączy fazy atomowo
+ * w jednym, zsynchronizowanym momencie (przy najbliższym COM).
+ *
+ * Przepływ dla normalnej pracy (RUN):
+ *   ISR Halla → pwm_preload_step(hi,lo,duty) → wpis do CCER+CCRx (preload)
+ *            → pwm_commutate()                 → TIM1->EGR = COMG
+ *            → HW kopiuje preload → active     → fazy przełączone atomowo
+ *
+ * Tryb bezpośredni (MANUAL / LEARN):
+ *   pwm_apply_step_direct() → tymczasowo wyłącza CCPC → wpis bezpośredni
+ */
 
-static void phase_set_compare(phase_t ph, uint16_t v)
-{
+/* Maski bitów CCER dla poszczególnych faz (high + low side).
+ * Używamy zapisu 32-bitowego (CCER to jeden rejestr 16-bit z parami CCxE/CCxNE). */
+#define CCER_CH1      (TIM_CCER_CC1E  | TIM_CCER_CC1NE)
+#define CCER_CH2      (TIM_CCER_CC2E  | TIM_CCER_CC2NE)
+#define CCER_CH3      (TIM_CCER_CC3E  | TIM_CCER_CC3NE)
+#define CCER_ALL      0x5555U  /* wszystkie 6 kanałów */
+
+/* Tablica: dla fazy PH_A/PH_B/PH_C → maska bitów CCER */
+static const uint16_t ccer_mask[3] = { CCER_CH1, CCER_CH2, CCER_CH3 };
+
+/* Mapa: faza → rejestr CCR */
+static inline volatile uint32_t *ccr_of(phase_t ph) {
     switch (ph) {
-        case PH_A: LL_TIM_OC_SetCompareCH1(TIM1, v); break;
-        case PH_B: LL_TIM_OC_SetCompareCH2(TIM1, v); break;
-        case PH_C: LL_TIM_OC_SetCompareCH3(TIM1, v); break;
+        case PH_A: return &TIM1->CCR1;
+        case PH_B: return &TIM1->CCR2;
+        case PH_C: return &TIM1->CCR3;
+    }
+    return &TIM1->CCR1;
+}
+
+/* Ustaw mostek: hi=modulowany PWM, lo=stale ON, reszta=wyłączona.
+ * ccpc_mode: true = preload (CCPC=1, wartości czekają na COM),
+ *            false = bezpośrednio (CCPC=0, wartości od razu aktywne). */
+static void apply_step_int(int8_t hi, int8_t lo, uint16_t duty, bool ccpc_mode)
+{
+    if (duty > PWM_DUTY_MAX) {
+        duty = PWM_DUTY_MAX;
+    }
+
+    uint16_t ccer_val = 0;
+
+    for (phase_t ph = PH_A; ph <= PH_C; ph++) {
+        if ((int8_t)ph == hi) {
+            *ccr_of(ph) = duty;
+            ccer_val |= ccer_mask[ph];
+        } else if ((int8_t)ph == lo) {
+            *ccr_of(ph) = 0;
+            ccer_val |= ccer_mask[ph];
+        } else {
+            *ccr_of(ph) = 0;
+            /* faza pływa — CCER=0 dla tego kanału */
+        }
+    }
+
+    if (ccpc_mode) {
+        /* CCPC=1: zapis do CCER/CCRx → preload. COM załaduje do aktywnych. */
+        TIM1->CCER = ccer_val;
+    } else {
+        /* Tryb bezpośredni: wyłącz CCPC → zapis idzie od razu do aktywnych. */
+        TIM1->CR2 &= ~TIM_CR2_CCPC;
+        TIM1->CCER = ccer_val;
+        TIM1->EGR = TIM_EGR_COMG;   /* dla pewności synchronizacja */
+        TIM1->CR2 |= TIM_CR2_CCPC;
     }
 }
 
-static void phase_enable(phase_t ph)
-{
-    LL_TIM_CC_EnableChannel(TIM1, k_ch[ph] | k_chn[ph]);
-}
+/* ------------------------------------------------------------------ */
+/* API                                                                */
+/* ------------------------------------------------------------------ */
 
-static void phase_disable(phase_t ph)
+void pwm_init(void)
 {
-    LL_TIM_CC_DisableChannel(TIM1, k_ch[ph] | k_chn[ph]);
-}
-
-static void gpio_init(void)
-{
+    /* GPIO: PA8/9/10 = HS PWM, PB13/14/15 = LS PWM */
     LL_APB2_GRP1_EnableClock(LL_APB2_GRP1_PERIPH_GPIOA |
                              LL_APB2_GRP1_PERIPH_GPIOB |
                              LL_APB2_GRP1_PERIPH_AFIO);
@@ -40,93 +99,66 @@ static void gpio_init(void)
 
     g.Pin = PWM_LS_PINS;
     LL_GPIO_Init(PWM_LS_PORT, &g);
-}
 
-void pwm_init(void)
-{
-    gpio_init();
-
+    /* TIM1 — center-aligned, CCPC=1 (preload na COM) */
     LL_APB2_GRP1_EnableClock(LL_APB2_GRP1_PERIPH_TIM1);
 
-    /* Baza czasu: center-aligned (symetryczny PWM). */
-    LL_TIM_InitTypeDef t = {0};
-    t.Prescaler         = 0;
-    t.CounterMode       = LL_TIM_COUNTERMODE_CENTER_UP;
-    t.Autoreload        = PWM_ARR;
-    t.ClockDivision     = LL_TIM_CLOCKDIVISION_DIV1;
-    t.RepetitionCounter = 0;
-    LL_TIM_Init(TIM1, &t);
-    LL_TIM_EnableARRPreload(TIM1);
+    /* Odblokuj dostęp do rejestrów TIM1 (advanced timer lock). */
+    TIM1->BDTR = TIM_BDTR_MOE;
 
-    /* Kanały OC 1..3 — PWM1, komplementarne, na razie wyłączone. */
-    LL_TIM_OC_InitTypeDef oc = {0};
-    oc.OCMode       = LL_TIM_OCMODE_PWM1;
-    oc.OCState      = LL_TIM_OCSTATE_DISABLE;
-    oc.OCNState     = LL_TIM_OCSTATE_DISABLE;
-    oc.CompareValue = 0;
-    oc.OCPolarity   = LL_TIM_OCPOLARITY_HIGH;
-    oc.OCNPolarity  = LL_TIM_OCPOLARITY_HIGH;
-    oc.OCIdleState  = LL_TIM_OCIDLESTATE_LOW;
-    oc.OCNIdleState = LL_TIM_OCIDLESTATE_LOW;
+    TIM1->PSC  = 0;
+    TIM1->ARR  = PWM_ARR;
+    TIM1->CR1  = TIM_CR1_ARPE | TIM_CR1_CMS_1;   /* ARR preload + center-aligned */
+    TIM1->CR2  = TIM_CR2_CCPC;                     /* preload CCER/CCRx na COM    */
+    TIM1->RCR  = 0;
 
-    LL_TIM_OC_Init(TIM1, LL_TIM_CHANNEL_CH1, &oc);
-    LL_TIM_OC_Init(TIM1, LL_TIM_CHANNEL_CH2, &oc);
-    LL_TIM_OC_Init(TIM1, LL_TIM_CHANNEL_CH3, &oc);
+    /* Kanały OC 1..3 — PWM1 na high-side, low-side komplementarny.
+     * Polaryzacja: high active-high, low active-high (z dead-time nie odwracamy). */
+    TIM1->CCMR1 = TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1PE |
+                  TIM_CCMR1_OC2M_2 | TIM_CCMR1_OC2M_1 | TIM_CCMR1_OC2PE;
+    TIM1->CCMR2 = TIM_CCMR2_OC3M_2 | TIM_CCMR2_OC3M_1 | TIM_CCMR2_OC3PE;
 
-    LL_TIM_OC_EnablePreload(TIM1, LL_TIM_CHANNEL_CH1);
-    LL_TIM_OC_EnablePreload(TIM1, LL_TIM_CHANNEL_CH2);
-    LL_TIM_OC_EnablePreload(TIM1, LL_TIM_CHANNEL_CH3);
+    TIM1->CCER = 0;  /* wszystkie kanały wyłączone na start */
 
-    /* Dead-time + ustawienia mostka. */
-    LL_TIM_BDTR_InitTypeDef bd = {0};
-    bd.OSSRState       = LL_TIM_OSSR_DISABLE;
-    bd.OSSIState       = LL_TIM_OSSI_DISABLE;
-    bd.LockLevel       = LL_TIM_LOCKLEVEL_OFF;
-    bd.DeadTime        = PWM_DEADTIME_REG;
-    bd.BreakState      = LL_TIM_BREAK_DISABLE;
-    bd.BreakPolarity   = LL_TIM_BREAK_POLARITY_HIGH;
-    bd.AutomaticOutput = LL_TIM_AUTOMATICOUTPUT_DISABLE;
-    LL_TIM_BDTR_Init(TIM1, &bd);
+    /* Dead-time + automatyczne wyjścia */
+    TIM1->BDTR = TIM_BDTR_MOE | PWM_DEADTIME_REG;
 
-    LL_TIM_GenerateEvent_UPDATE(TIM1);
-    LL_TIM_EnableCounter(TIM1);
-    LL_TIM_EnableAllOutputs(TIM1);
+    /* Generuj UPDATE aby załadować ARR, potem COM dla CCER/CCR */
+    TIM1->EGR = TIM_EGR_UG;
+    TIM1->EGR = TIM_EGR_COMG;
+    TIM1->CR1 |= TIM_CR1_CEN;
 
     pwm_coast();
 }
 
-void pwm_apply_step(int8_t hi, int8_t lo, uint16_t duty)
+void pwm_preload_step(int8_t hi, int8_t lo, uint16_t duty)
 {
-    if (duty > PWM_DUTY_MAX) {
-        duty = PWM_DUTY_MAX;
-    }
+    apply_step_int(hi, lo, duty, true);
+}
 
-    for (phase_t ph = PH_A; ph <= PH_C; ph++) {
-        if ((int8_t)ph == hi) {
-            phase_set_compare(ph, duty);   /* high-side modulowany */
-            phase_enable(ph);
-        } else if ((int8_t)ph == lo) {
-            phase_set_compare(ph, 0);      /* low-side stale ON     */
-            phase_enable(ph);
-        } else {
-            phase_set_compare(ph, 0);
-            phase_disable(ph);             /* faza pływa            */
-        }
-    }
+void pwm_commutate(void)
+{
+    TIM1->EGR = TIM_EGR_COMG;
+}
+
+void pwm_apply_step_direct(int8_t hi, int8_t lo, uint16_t duty)
+{
+    apply_step_int(hi, lo, duty, false);
 }
 
 void pwm_brake(void)
 {
-    for (phase_t ph = PH_A; ph <= PH_C; ph++) {
-        phase_set_compare(ph, 0);
-        phase_enable(ph);
-    }
+    /* Wszystkie low-side ON, high-side OFF.
+     * PWM1 z CCR=0: OCxREF=0 zawsze → OCxN (low-side)=1 zawsze. */
+    TIM1->CCR1 = TIM1->CCR2 = TIM1->CCR3 = 0;
+    TIM1->CCER = CCER_ALL;
+    TIM1->EGR = TIM_EGR_COMG;
 }
 
 void pwm_coast(void)
 {
-    for (phase_t ph = PH_A; ph <= PH_C; ph++) {
-        phase_set_compare(ph, 0);
-        phase_disable(ph);
-    }
+    /* Wszystkie tranzystory wyłączone (wysoka impedancja). */
+    TIM1->CCR1 = TIM1->CCR2 = TIM1->CCR3 = 0;
+    TIM1->CCER = 0;
+    TIM1->EGR = TIM_EGR_COMG;
 }

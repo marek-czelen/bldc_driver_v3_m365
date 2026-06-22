@@ -3,20 +3,22 @@
 #include "pwm.h"
 #include "hall.h"
 #include "timebase.h"
+#include "eeprom.h"
 
 /* ------------------------------------------------------------------ */
 /* Tablice komutacji 6-step (indeks = stan Halla 0..7).               */
-/* Domyślna sekwencja Graya: 1->3->2->6->4->5->1.                     */
-/* Można je nadpisać uczeniem (motor_learn_hall).                     */
+/* Sekwencja zgodna z działającym v2 (block.c):                        */
+/*   Hall: 1→3→2→6→4→5                                                */
+/*   Krok: A+B- → A+C- → B+C- → B+A- → C+A- → C+B-                    */
 /* ------------------------------------------------------------------ */
 /*  hall:  0    1    2    3    4    5    6    7                        */
-static const int8_t k_hi_fwd[8] = { -1, PH_C, PH_B, PH_C, PH_A, PH_A, PH_B, -1 };
-static const int8_t k_lo_fwd[8] = { -1, PH_B, PH_A, PH_A, PH_C, PH_B, PH_C, -1 };
+static const int8_t k_hi_fwd[8] = { -1, PH_A, PH_B, PH_A, PH_C, PH_C, PH_B, -1 };
+static const int8_t k_lo_fwd[8] = { -1, PH_B, PH_C, PH_C, PH_A, PH_B, PH_A, -1 };
 
-/* 6 wektorów w kolejności elektrycznej (kalibracja/uczenie). */
+/* Wektory uczenia w kolejności v2 (zgodnej z kierunkiem jazdy). */
 /*               krok: 0     1     2     3     4     5                  */
-static const int8_t k_vec_hi[6] = { PH_C, PH_C, PH_B, PH_B, PH_A, PH_A };
-static const int8_t k_vec_lo[6] = { PH_B, PH_A, PH_A, PH_C, PH_C, PH_B };
+static const int8_t k_vec_hi[6] = { PH_A, PH_A, PH_B, PH_B, PH_C, PH_C };
+static const int8_t k_vec_lo[6] = { PH_B, PH_C, PH_C, PH_A, PH_A, PH_B };
 
 /* Aktywne tablice komutacji: [kierunek][stan Halla].                 */
 /* Wypełniane domyślnie lub przez uczenie. -1 = stan niepoprawny.     */
@@ -67,7 +69,7 @@ static void load_default_tables(void)
     s_learned = false;
 }
 
-static void commutate(uint8_t hall)
+static void hw_commutate(uint8_t hall)
 {
     int8_t hi = s_hi[s_dir][hall & 0x07];
     int8_t lo = s_lo[s_dir][hall & 0x07];
@@ -78,7 +80,9 @@ static void commutate(uint8_t hall)
         s_state = MSTATE_FAULT;
         return;
     }
-    pwm_apply_step(hi, lo, s_duty);
+    /* Preload CCER+CCRx, potem atomowe przełączenie przez COM. */
+    pwm_preload_step(hi, lo, s_duty);
+    pwm_commutate();
 }
 
 
@@ -93,6 +97,11 @@ void motor_init(void)
     s_target_rpm = 0.0f;
     s_rpm = 0.0f;
     load_default_tables();
+
+    /* Spróbuj wczytać zapisaną konfigurację Halla z EEPROM.
+     * Jeśli jest poprawna — nadpisuje domyślną tablicę. */
+    motor_config_load();
+
     pwm_coast();
 }
 
@@ -107,7 +116,7 @@ void motor_start(void)
     s_last_hall_us = micros();
     s_hall = hall_read();
     /* Wymuś pierwszą komutację (silnik stoi -> brak zbocza Halla). */
-    commutate(s_hall);
+    hw_commutate(s_hall);
 }
 
 void motor_stop(void)
@@ -130,7 +139,7 @@ void motor_force_vector(uint8_t idx)
         return;
     }
     s_state = MSTATE_MANUAL;
-    pwm_apply_step(k_vec_hi[idx], k_vec_lo[idx], s_duty);
+    pwm_apply_step_direct(k_vec_hi[idx], k_vec_lo[idx], s_duty);
 }
 
 /*
@@ -173,7 +182,7 @@ bool motor_learn_hall_with_duty(float duty_pct, uint8_t *seq_out)
     /* --- Pas kondycjonujący (2× bez odczytu, rozrywa tarcie) --- */
     for (uint8_t pass = 0; pass < 2; pass++) {
         for (uint8_t v = 0; v < 6; v++) {
-            pwm_apply_step(k_vec_hi[v], k_vec_lo[v], learn_duty);
+            pwm_apply_step_direct(k_vec_hi[v], k_vec_lo[v], learn_duty);
             delay_ms(settle);
         }
     }
@@ -182,7 +191,7 @@ bool motor_learn_hall_with_duty(float duty_pct, uint8_t *seq_out)
     for (uint8_t lap = 0; lap < 2; lap++) {
         for (uint8_t v = 0; v < 6; v++) {
             /* 1) przeskok do nowej pozycji — pełne duty */
-            pwm_apply_step(k_vec_hi[v], k_vec_lo[v], learn_duty);
+            pwm_apply_step_direct(k_vec_hi[v], k_vec_lo[v], learn_duty);
             delay_ms(settle);
 
             /* 2) hamulec zwarciowy — tłumi oscylacje wirnika */
@@ -194,7 +203,7 @@ bool motor_learn_hall_with_duty(float duty_pct, uint8_t *seq_out)
             delay_ms(5);
 
             /* 4) delikatne przytrzymanie — duty trzymające, bez wzbudzania oscylacji */
-            pwm_apply_step(k_vec_hi[v], k_vec_lo[v], hold_duty);
+            pwm_apply_step_direct(k_vec_hi[v], k_vec_lo[v], hold_duty);
 
             /* 5) pętla stabilności: czekaj aż Hall przestanie się zmieniać */
             uint8_t last = hall_read();
@@ -256,6 +265,10 @@ bool motor_learn_hall_with_duty(float duty_pct, uint8_t *seq_out)
     s_hi[DIR_REV][7] = s_lo[DIR_REV][7] = -1;
 
     s_learned = true;
+
+    /* Automatycznie zapisz do EEPROM po udanym uczeniu. */
+    motor_config_save();
+
     return true;
 }
 
@@ -270,6 +283,82 @@ bool motor_is_learned(void)
     return s_learned;
 }
 
+/* ------------------------------------------------------------------ */
+/* EEPROM — zapis/odczyt konfiguracji Halla                          */
+/* ------------------------------------------------------------------ */
+
+bool motor_config_save(void)
+{
+    eeprom_config_t cfg;
+    cfg.magic      = 0x4C48U;  /* 'H' 'L' */
+    cfg.version    = 1U;
+    cfg.pole_pairs = MOTOR_POLE_PAIRS;
+
+    /* Kopiujemy stany hall=1..6 (indeksy 0 i 7 zawsze niepoprawne). */
+    for (uint8_t h = 1; h <= 6; h++) {
+        cfg.hi_fwd[h - 1] = s_hi[DIR_FWD][h];
+        cfg.lo_fwd[h - 1] = s_lo[DIR_FWD][h];
+    }
+    cfg.crc16 = 0;
+
+    return eeprom_save(&cfg);
+}
+
+bool motor_config_load(void)
+{
+    eeprom_config_t cfg;
+    if (!eeprom_load(&cfg)) {
+        return false;
+    }
+
+    /* Odtwórz tablice komutacji z zapisanej konfiguracji. */
+    for (uint8_t h = 1; h <= 6; h++) {
+        s_hi[DIR_FWD][h] = cfg.hi_fwd[h - 1];
+        s_lo[DIR_FWD][h] = cfg.lo_fwd[h - 1];
+        /* Kierunek wsteczny = zamiana hi/lo */
+        if (cfg.hi_fwd[h - 1] < 0) {
+            s_hi[DIR_REV][h] = -1;
+            s_lo[DIR_REV][h] = -1;
+        } else {
+            s_hi[DIR_REV][h] = cfg.lo_fwd[h - 1];
+            s_lo[DIR_REV][h] = cfg.hi_fwd[h - 1];
+        }
+    }
+    s_hi[DIR_FWD][0] = s_lo[DIR_FWD][0] = -1;
+    s_hi[DIR_FWD][7] = s_lo[DIR_FWD][7] = -1;
+    s_hi[DIR_REV][0] = s_lo[DIR_REV][0] = -1;
+    s_hi[DIR_REV][7] = s_lo[DIR_REV][7] = -1;
+
+    s_learned = true;
+    return true;
+}
+
+bool motor_config_erase(void)
+{
+    eeprom_erase();
+    /* Przywróć domyślną tablicę. */
+    load_default_tables();
+    s_learned = false;
+    return true;
+}
+
+uint8_t motor_get_hall_seq(uint8_t idx)
+{
+    if (idx > 5U) {
+        return 0;
+    }
+    /* Znajdź stan Halla dla danego wektora (idx = pozycja w sekwencji). */
+    /* Wyszukujemy w tablicy s_hi[DIR_FWD] który stan Halla odpowiada */
+    /* wektorowi o indeksie idx (gdzie k_vec_hi/lo[idx] to para hi/lo). */
+    for (uint8_t h = 1; h <= 6; h++) {
+        if (s_hi[DIR_FWD][h] == k_vec_hi[idx] &&
+            s_lo[DIR_FWD][h] == k_vec_lo[idx]) {
+            return h;
+        }
+    }
+    return 0;
+}
+
 void motor_set_mode(motor_mode_t mode)
 {
     motor_stop();
@@ -280,7 +369,7 @@ void motor_set_dir(motor_dir_t dir)
 {
     s_dir = dir;
     if (s_state == MSTATE_RUN) {
-        commutate(hall_read());
+        hw_commutate(hall_read());
     }
 }
 
@@ -289,7 +378,7 @@ void motor_set_duty_pct(float pct)
     s_ctrl = CTRL_DUTY;
     s_duty = duty_pct_to_raw(pct);
     if (s_state == MSTATE_RUN) {
-        commutate(hall_read());
+        hw_commutate(hall_read());
     }
 }
 
@@ -334,7 +423,7 @@ void motor_on_hall(void)
     }
 
     if (s_state == MSTATE_RUN) {
-        commutate(h);
+        hw_commutate(h);
     }
 }
 
@@ -367,6 +456,6 @@ void motor_tick_1ms(void)
         if (out > (float)PWM_DUTY_MAX)     out = (float)PWM_DUTY_MAX;
 
         s_duty = (uint16_t)out;
-        commutate(s_hall);
+        hw_commutate(s_hall);
     }
 }

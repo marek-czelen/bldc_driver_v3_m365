@@ -46,6 +46,12 @@ bool motor_learn_hall_with_duty(float duty_pct, uint8_t *seq_out);
 bool motor_learn_hall(uint8_t *seq_out);
 bool motor_is_learned(void);
 
+/* EEPROM: zapis/odczyt/kasowanie konfiguracji Halla. */
+bool motor_config_save(void);          /* zapisz aktualną tablicę do Flash */
+bool motor_config_load(void);          /* wczytaj tablicę z Flash (true=OK) */
+bool motor_config_erase(void);         /* wyczyść zapisaną konfigurację */
+uint8_t motor_get_hall_seq(uint8_t idx); /* odczytaj nauczony stan Halla dla wektora idx (0..5) */
+
 /* Konfiguracja */
 void motor_set_mode(motor_mode_t mode);
 void motor_set_dir(motor_dir_t dir);

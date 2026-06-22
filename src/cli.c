@@ -20,6 +20,9 @@
  *   M<0|1>     tryb 0=BLOCK 1=SINUS
  *   V<0..5>    wymuszenie wektora komutacji (kalibracja, open-loop)
  *   L[%]       uczenie sekwencji Halla, np. "L" lub "L25" dla 25% duty
+ *   K          zapisz konfiguracje Halla do EEPROM
+ *   P          wypisz zapisana konfiguracje (sekwencja Halla)
+ *   X          usun zapisana konfiguracje (powrot do domyslnej)
  *   A          odczyt analogowy: vbat,Ia,Ib,Ic (raw ADC)
  *   ?          status (CSV)
  *   H / I      pomoc
@@ -32,7 +35,8 @@ static void print_help(void)
     uart_write(
         "R start | S stop | B brake\r\n"
         "D<n> duty% | N<n> rpm | F<0|1> dir | M<0|1> tryb\r\n"
-        "V<0-5> wektor | L[%] ucz-hall | A analog | ? status | H pomoc\r\n");
+        "V<0-5> wektor | L[%] ucz-hall | K save | P cfg | X erase\r\n"
+        "A analog | ? status | H pomoc\r\n");
 }
 
 /* status: st,md,dir,ct,hall,duty%,rpm */
@@ -55,6 +59,16 @@ static void print_analog(void)
                 (unsigned)adc_read(ADC_CH_IA),
                 (unsigned)adc_read(ADC_CH_IB),
                 (unsigned)adc_read(ADC_CH_IC));
+}
+
+/* Wypisz zapisaną/aktywną konfigurację Halla. */
+static void print_config(void)
+{
+    uart_printf("hall_seq=%u,%u,%u,%u,%u,%u learned=%d\r\n",
+                motor_get_hall_seq(0), motor_get_hall_seq(1),
+                motor_get_hall_seq(2), motor_get_hall_seq(3),
+                motor_get_hall_seq(4), motor_get_hall_seq(5),
+                motor_is_learned() ? 1 : 0);
 }
 
 static void handle_line(const char *line)
@@ -143,6 +157,20 @@ static void handle_line(const char *line)
                         seq[0], seq[1], seq[2], seq[3], seq[4], seq[5]);
             break;
         }
+        case 'K':
+            if (motor_config_save()) {
+                uart_write("OK\r\n");
+            } else {
+                uart_write("E\r\n");
+            }
+            break;
+        case 'P':
+            print_config();
+            break;
+        case 'X':
+            motor_config_erase();
+            uart_write("OK\r\n");
+            break;
         case 'A':
             print_analog();
             break;
