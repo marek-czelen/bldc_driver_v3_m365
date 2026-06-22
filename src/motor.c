@@ -5,6 +5,7 @@
 #include "timebase.h"
 #include "eeprom.h"
 #include "sinus.h"
+#include "foc.h"
 #include "adc.h"
 #include "uart.h"
 
@@ -107,8 +108,7 @@ void motor_init(void)
     s_rpm = 0.0f;
     s_stall_ticks = 0;
     load_default_tables();
-    sinus_init();          /* ustaw domyślne 60° / slope=0 */
-
+    sinus_init();          /* ustaw domyślne 60° / slope=0 */    foc_init();
     /* Spróbuj wczytać zapisaną konfigurację z EEPROM.
      * Jeśli poprawna — nadpisuje tablice Halla, advance, slope. */
     motor_config_load();
@@ -129,6 +129,15 @@ void motor_start(void)
         sinus_start();
         return;
     }
+    if (s_mode == MODE_FOC) {
+        s_pi_integ = 0.0f;
+        s_state = MSTATE_RUN;
+        s_last_hall_us = micros();
+        s_hall = hall_read();
+        foc_set_iq_target((int16_t)((float)s_duty * (float)FOC_IQ_MAX / (float)PWM_DUTY_MAX));
+        foc_start();
+        return;
+    }
     if (s_mode != MODE_BLOCK) {
         return;
     }
@@ -145,6 +154,7 @@ void motor_stop(void)
     s_state = MSTATE_IDLE;
     s_duty  = 0;
     sinus_stop();
+    foc_stop();
     pwm_coast();
 }
 
@@ -441,11 +451,14 @@ void motor_set_duty_pct(float pct)
     if (s_state == MSTATE_RUN) {
         if (s_mode == MODE_SINUS) {
             sinus_set_amplitude(pct);
-            /* R ma być podtrzymane aż do S:
-             * jeśli SINUS zatrzymał się po timeout Halla (np. po D0),
-             * dodatnie duty ma go ponownie uzbroić bez ponownego R. */
             if (pct > 0.0f && !sinus_is_running()) {
                 sinus_start();
+            }
+        } else if (s_mode == MODE_FOC) {
+            int16_t iq = (int16_t)(pct * (float)FOC_IQ_MAX / 100.0f);
+            foc_set_iq_target(iq);
+            if (pct > 0.0f && !foc_is_running()) {
+                foc_start();
             }
         } else {
             hw_commutate(hall_read());
@@ -468,6 +481,9 @@ float         motor_get_rpm(void)
 {
     if (s_mode == MODE_SINUS) {
         return sinus_get_rpm();
+    }
+    if (s_mode == MODE_FOC) {
+        return foc_get_rpm();
     }
     return s_rpm;
 }
@@ -544,6 +560,12 @@ void motor_poll_events(void)
 /* ------------------------------------------------------------------ */
 void motor_tick_1ms(void)
 {
+    /* FOC — osobna ścieżka (nie używa s_stall_ticks BLOCKa). */
+    if (s_mode == MODE_FOC) {
+        foc_update();
+        return;
+    }
+
     /* W SINUSIE główna pętla sinusa wykonuje estymację + PWM. */
     if (s_mode == MODE_SINUS) {
         sinus_update();

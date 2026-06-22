@@ -2,6 +2,7 @@
 #include "uart.h"
 #include "motor.h"
 #include "adc.h"
+#include "foc.h"
 #include "board.h"
 #include <stdlib.h>
 
@@ -42,9 +43,10 @@ static void cmd_help(void)
 {
     uart_write("BLDC v3\r\n"
         "R start S stop B brake W ping\r\n"
-        "D<n> duty% N<n> rpm F0|1 dir M0|1 tryb\r\n"
+        "D<n> duty% N<n> rpm F0|1 dir M0|1|2 tryb\r\n"
         "V<0-5> wektor L[%%] ucz-hall K save P cfg X erase\r\n"
-        "O<deg> advance J<slp> slope A analog ? status H help\r\n");
+        "O<deg> advance J<slp> slope A analog ? status H help\r\n"
+        "G<k> Kp_Iq Z<k> Ki_Iq (FOC tune)\r\n");
 }
 
 static void cmd_status(void)
@@ -52,14 +54,29 @@ static void cmd_status(void)
     int16_t ia = adc_read_current_ma(ADC_CH_IA);
     int16_t ib = adc_read_current_ma(ADC_CH_IB);
     int16_t ic = adc_read_current_ma(ADC_CH_IC);
-    uart_printf("st=%d md=%d dir=%d ct=%d h=%u d=%d rpm=%d ia=%d ib=%d ic=%d adv=%.1f slp=%.1f\r\n",
-        (int)motor_get_state(), (int)motor_get_mode(),
-        (int)motor_get_dir(), (int)motor_get_ctrl(),
-        (unsigned)motor_get_hall(), (int)motor_get_duty_pct(),
-        (int)motor_get_rpm(),
-        (int)ia, (int)ib, (int)ic,
-        (double)motor_get_advance_deg(),
-        (double)motor_get_advance_slope());
+    int adv_d1 = (int)(motor_get_advance_deg() * 10.0f + 0.5f);
+    int slp_d1 = (int)(motor_get_advance_slope() * 10.0f + 0.5f);
+    if (motor_get_mode() == MODE_FOC) {
+        int kp_d2 = (int)(foc_get_kp_iq() * 100.0f + 0.5f);
+        int ki_d2 = (int)(foc_get_ki_iq() * 100.0f + 0.5f);
+        uart_printf("st=%d md=%d dir=%d d=%d rpm=%d ia=%d ib=%d ic=%d iq=%d id=%d kp=%d.%02d ki=%d.%02d\r\n",
+            (int)motor_get_state(), (int)motor_get_mode(),
+            (int)motor_get_dir(),
+            (int)motor_get_duty_pct(), (int)motor_get_rpm(),
+            (int)ia, (int)ib, (int)ic,
+            (int)foc_get_iq_ma(), (int)foc_get_id_ma(),
+            kp_d2 / 100, kp_d2 % 100,
+            ki_d2 / 100, ki_d2 % 100);
+    } else {
+        uart_printf("st=%d md=%d dir=%d ct=%d h=%u d=%d rpm=%d ia=%d ib=%d ic=%d adv=%d.%d slp=%d.%d\r\n",
+            (int)motor_get_state(), (int)motor_get_mode(),
+            (int)motor_get_dir(), (int)motor_get_ctrl(),
+            (unsigned)motor_get_hall(), (int)motor_get_duty_pct(),
+            (int)motor_get_rpm(),
+            (int)ia, (int)ib, (int)ic,
+            adv_d1 / 10, adv_d1 % 10,
+            slp_d1 / 10, slp_d1 % 10);
+    }
 }
 
 static void cmd_analog(void)
@@ -73,13 +90,15 @@ static void cmd_analog(void)
 
 static void cmd_config(void)
 {
-    uart_printf("seq=%u,%u,%u,%u,%u,%u ok=%d adv=%.1f slp=%.1f\r\n",
+    int adv_d1 = (int)(motor_get_advance_deg() * 10.0f + 0.5f);
+    int slp_d1 = (int)(motor_get_advance_slope() * 10.0f + 0.5f);
+    uart_printf("seq=%u,%u,%u,%u,%u,%u ok=%d adv=%d.%d slp=%d.%d\r\n",
         motor_get_hall_seq(0), motor_get_hall_seq(1),
         motor_get_hall_seq(2), motor_get_hall_seq(3),
         motor_get_hall_seq(4), motor_get_hall_seq(5),
         motor_is_learned() ? 1 : 0,
-        (double)motor_get_advance_deg(),
-        (double)motor_get_advance_slope());
+        adv_d1 / 10, adv_d1 % 10,
+        slp_d1 / 10, slp_d1 % 10);
 }
 
 void cli_init(void)
@@ -160,8 +179,8 @@ void cli_process(void)
     case 'M': {
         int v;
         if (!parse_int_arg(arg, &v))   { RESP_E("ARG"); break; }
-        if (!(v == 0 || v == 1))       { RESP_E("RANGE"); break; }
-        motor_set_mode((v == 1) ? MODE_SINUS : MODE_BLOCK);
+        if (!(v == 0 || v == 1 || v == 2)) { RESP_E("RANGE"); break; }
+        motor_set_mode((v == 2) ? MODE_FOC : (v == 1) ? MODE_SINUS : MODE_BLOCK);
         RESP_OK();
         break;
     }
@@ -172,7 +191,7 @@ void cli_process(void)
         if (!parse_float_arg(arg, &v)) { RESP_E("ARG"); break; }
         if (v < 0.0f || v > 120.0f)    { RESP_E("RANGE"); break; }
         motor_set_advance_deg(v);
-        motor_config_save();  /* auto-zapis do EEPROM */
+        if (!motor_config_save()) { RESP_E("SAVE"); break; }
         RESP_OK();
         break;
     }
@@ -181,7 +200,23 @@ void cli_process(void)
         if (!parse_float_arg(arg, &v)) { RESP_E("ARG"); break; }
         if (v < 0.0f || v > 50.0f)     { RESP_E("RANGE"); break; }
         motor_set_advance_slope(v);
-        motor_config_save();  /* auto-zapis do EEPROM */
+        if (!motor_config_save()) { RESP_E("SAVE"); break; }
+        RESP_OK();
+        break;
+    }
+    case 'G': {
+        float v;
+        if (!parse_float_arg(arg, &v)) { RESP_E("ARG"); break; }
+        if (v < 0.001f || v > 5.0f)    { RESP_E("RANGE"); break; }
+        foc_set_kp_iq(v);
+        RESP_OK();
+        break;
+    }
+    case 'Z': {
+        float v;
+        if (!parse_float_arg(arg, &v)) { RESP_E("ARG"); break; }
+        if (v < 0.001f || v > 10.0f)   { RESP_E("RANGE"); break; }
+        foc_set_ki_iq(v);
         RESP_OK();
         break;
     }

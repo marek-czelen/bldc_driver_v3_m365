@@ -1,4 +1,4 @@
-/** motor.h — sterowanie silnikiem BLDC (tryb BLOCK; SINUS w przyszłości). */
+/** motor.h — sterowanie silnikiem BLDC (tryb BLOCK; SINUS, FOC). */
 #ifndef MOTOR_H
 #define MOTOR_H
 
@@ -6,8 +6,9 @@
 #include <stdbool.h>
 
 typedef enum {
-    MODE_BLOCK = 0,   /* komutacja 6-step (zaimplementowane)        */
-    MODE_SINUS = 1,   /* sterowanie sinusoidalne (szkielet)         */
+    MODE_BLOCK = 0,   /* komutacja 6-step                           */
+    MODE_SINUS = 1,   /* sterowanie sinusoidalne                    */
+    MODE_FOC   = 2,   /* Field Oriented Control (prądowe)           */
 } motor_mode_t;
 
 typedef enum {
