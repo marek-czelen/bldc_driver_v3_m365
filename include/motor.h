@@ -57,6 +57,8 @@ void motor_set_mode(motor_mode_t mode);
 void motor_set_dir(motor_dir_t dir);
 void motor_set_duty_pct(float pct);     /* 0..100, przełącza w CTRL_DUTY  */
 void motor_set_target_rpm(float rpm);   /* przełącza w CTRL_SPEED         */
+void motor_set_advance_deg(float deg);  /* przesunięcie fazowe SINUS [°]  */
+void motor_set_advance_slope(float deg_per_a); /* redukcja advance od prądu [°/A] */
 
 /* Odczyty */
 motor_mode_t  motor_get_mode(void);
@@ -66,11 +68,16 @@ ctrl_mode_t   motor_get_ctrl(void);
 float         motor_get_rpm(void);
 float         motor_get_duty_pct(void);
 uint8_t       motor_get_hall(void);
+float         motor_get_advance_deg(void);  /* przesunięcie fazowe SINUS [°] */
+float         motor_get_advance_slope(void); /* redukcja advance [°/A]        */
 
 /* Wywoływane z ISR Halla (komutacja) */
 void motor_on_hall(void);
 
 /* Pętla regulacji — wywoływana co 1 ms z SysTick. */
 void motor_tick_1ms(void);
+
+/* Raportowanie zdarzeń (stall) — wołane z głównej pętli. */
+void motor_poll_events(void);
 
 #endif /* MOTOR_H */

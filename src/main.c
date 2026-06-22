@@ -27,6 +27,7 @@ int main(void)
 
     for (;;) {
         cli_process();
+        motor_poll_events();
     }
 }
 

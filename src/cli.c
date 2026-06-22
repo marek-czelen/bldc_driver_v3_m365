@@ -44,7 +44,7 @@ static void cmd_help(void)
         "R start S stop B brake W ping\r\n"
         "D<n> duty% N<n> rpm F0|1 dir M0|1 tryb\r\n"
         "V<0-5> wektor L[%%] ucz-hall K save P cfg X erase\r\n"
-    "A analog ? status H help\r\n");
+        "O<deg> advance J<slp> slope A analog ? status H help\r\n");
 }
 
 static void cmd_status(void)
@@ -52,12 +52,14 @@ static void cmd_status(void)
     int16_t ia = adc_read_current_ma(ADC_CH_IA);
     int16_t ib = adc_read_current_ma(ADC_CH_IB);
     int16_t ic = adc_read_current_ma(ADC_CH_IC);
-    uart_printf("st=%d md=%d dir=%d ct=%d h=%u d=%d rpm=%d ia=%d ib=%d ic=%d\r\n",
+    uart_printf("st=%d md=%d dir=%d ct=%d h=%u d=%d rpm=%d ia=%d ib=%d ic=%d adv=%.1f slp=%.1f\r\n",
         (int)motor_get_state(), (int)motor_get_mode(),
         (int)motor_get_dir(), (int)motor_get_ctrl(),
         (unsigned)motor_get_hall(), (int)motor_get_duty_pct(),
         (int)motor_get_rpm(),
-        (int)ia, (int)ib, (int)ic);
+        (int)ia, (int)ib, (int)ic,
+        (double)motor_get_advance_deg(),
+        (double)motor_get_advance_slope());
 }
 
 static void cmd_analog(void)
@@ -71,11 +73,13 @@ static void cmd_analog(void)
 
 static void cmd_config(void)
 {
-    uart_printf("seq=%u,%u,%u,%u,%u,%u ok=%d\r\n",
+    uart_printf("seq=%u,%u,%u,%u,%u,%u ok=%d adv=%.1f slp=%.1f\r\n",
         motor_get_hall_seq(0), motor_get_hall_seq(1),
         motor_get_hall_seq(2), motor_get_hall_seq(3),
         motor_get_hall_seq(4), motor_get_hall_seq(5),
-        motor_is_learned() ? 1 : 0);
+        motor_is_learned() ? 1 : 0,
+        (double)motor_get_advance_deg(),
+        (double)motor_get_advance_slope());
 }
 
 void cli_init(void)
@@ -163,6 +167,24 @@ void cli_process(void)
     }
 
     /* ── Kalibracja / konfiguracja ── */
+    case 'O': {
+        float v;
+        if (!parse_float_arg(arg, &v)) { RESP_E("ARG"); break; }
+        if (v < 0.0f || v > 120.0f)    { RESP_E("RANGE"); break; }
+        motor_set_advance_deg(v);
+        motor_config_save();  /* auto-zapis do EEPROM */
+        RESP_OK();
+        break;
+    }
+    case 'J': {
+        float v;
+        if (!parse_float_arg(arg, &v)) { RESP_E("ARG"); break; }
+        if (v < 0.0f || v > 50.0f)     { RESP_E("RANGE"); break; }
+        motor_set_advance_slope(v);
+        motor_config_save();  /* auto-zapis do EEPROM */
+        RESP_OK();
+        break;
+    }
     case 'V': {
         int v;
         if (!parse_int_arg(arg, &v))   { RESP_E("ARG"); break; }

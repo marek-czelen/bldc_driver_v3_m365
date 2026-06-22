@@ -9,8 +9,10 @@
 /* Konfiguracja silnika przechowywana w emulowanym EEPROM. */
 typedef struct {
     uint16_t magic;         /* 0x4C48 = 'H''L' (little-endian)        */
-    uint16_t version;       /* 1                                       */
+    uint16_t version;       /* 2                                       */
     uint16_t pole_pairs;    /* liczba par biegunów                     */
+    uint16_t phase_advance_deg10;    /* advance SINUS przy 0A [deg*10]   */
+    uint16_t phase_advance_slope;    /* redukcja advance [deg*10 na A*10]*/
     int8_t   hi_fwd[6];     /* hi dla hall=1..6, -1=niepoprawny       */
     int8_t   lo_fwd[6];     /* lo dla hall=1..6                       */
     uint16_t crc16;         /* CRC całej struktury (pole CRC=0 przy liczeniu) */

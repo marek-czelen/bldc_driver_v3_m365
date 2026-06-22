@@ -2,6 +2,8 @@
 #include "board.h"
 #include "timebase.h"
 #include "hall.h"
+#include "adc.h"
+#include <stdlib.h>
 
 /*
  * Sterowanie sinusoidalne — odwzorowanie działającego v2_stm.
@@ -34,11 +36,15 @@ static const uint16_t sin3_table[256] = {
      442,  471,  501,  532,  564,  597,  631,  666,  701,  737,  773,  810,  848,  886,  924,  962,
 };
 
-/* 65536 * 60°/360° */
-#define ADV_OFFSET  10923U
+/* Dynamiczne przesunięcie fazowe (domyślnie 60°).
+ * 65536 * deg / 360°  →  60° = 10923. */
+static uint16_t s_advance_raw = 10923U;  /* 60° w skali 0..65535 */
+static float    s_advance_slope = 0.0f;  /* deg/A — redukcja advance od prądu */
 
 /* ── Stan ──────────────────────────────────────────────────── */
 static bool     s_running       = false;
+static bool     s_stall_reported = false; /* throttling UART */
+static uint32_t s_stall_count   = 0;
 static uint16_t s_angle;          /* kąt wirnika 0..65535 (0..360°) */
 
 static float    s_modulation;     /* 0..1 */
@@ -65,6 +71,8 @@ static const uint16_t hall_angle[8] = {
 void sinus_init(void)
 {
     s_running        = false;
+    s_stall_reported = false;
+    s_stall_count    = 0;
     s_angle          = 0;
     s_modulation     = 0.0f;
     s_rpm            = 0.0f;
@@ -107,6 +115,7 @@ void sinus_stop(void)
     TIM1->EGR  = TIM_EGR_COMG;
     s_modulation  = 0.0f;
     s_speed_valid = false;
+    s_rpm         = 0.0f;
 }
 
 void sinus_set_amplitude(float pct)
@@ -174,19 +183,52 @@ void sinus_update(void)
         s_angle = (uint16_t)((uint32_t)hall_angle[hall] + inc);
     }
 
-    /* Timeout Halla. */
+    /* Gdy brak pomiaru prędkości — powolny zanik RPM. */
+    if (!s_speed_valid) {
+        s_rpm = s_rpm * 0.99f;
+        if (s_rpm < 1.0f) s_rpm = 0.0f;
+    }
+
+    /* Timeout Halla — silnik zablokowany. Nie zatrzymuj, próbuj wznowić. */
     if ((now - s_last_hall_ms) > HALL_TIMEOUT_MS) {
-        sinus_stop();
-        return;
+        if (!s_stall_reported) {
+            s_stall_reported = true;
+            s_stall_count++;
+        }
+        /* Restart estymatora: snap kąta do aktualnego Halla,
+         * wyzeruj estymację prędkości, jedź dalej z zadaną modulacją. */
+        uint8_t hall_now = hall_read();
+        if (hall_now >= 1 && hall_now <= 6) {
+            s_angle = hall_angle[hall_now] + 5461U;
+        }
+        s_last_hall      = hall_now;
+        s_last_hall_ms   = now;
+        s_hall_period_ms = 0;
+        s_speed_valid    = false;
+        s_rpm = s_rpm * 0.95f;  /* powolny zanik RPM */
+        /* Nie return — przejdź do generacji sinusa z odświeżonym kątem. */
+    } else {
+        s_stall_reported = false;
     }
 
     /* ══════════════════════════════════════════════════════════
-     * Generacja sinusa z advance 60° (jak w działającym v2).
-     *
-     * W v2:  A=sin(θ+60°), B=sin(θ-60°), C=sin(θ-180°)
-     * W tablicy (0..255): dodajemy odpowiednie offsety.
-     * ══════════════════════════════════════════════════════════ */
-    uint16_t adv = s_angle + ADV_OFFSET;
+     * Generacja sinusa z adaptacyjnym advance.
+     * advance_efektywne = advance_bazowe - slope * |I_avg|
+     * gdzie |I_avg| = (|ia|+|ib|+|ic|) / 3 [A]. */
+    uint16_t effective_adv = s_advance_raw;
+    if (s_advance_slope > 0.001f) {
+        int16_t ia = adc_read_current_ma(ADC_CH_IA);
+        int16_t ib = adc_read_current_ma(ADC_CH_IB);
+        int16_t ic = adc_read_current_ma(ADC_CH_IC);
+        float i_avg = (float)(abs((int)ia) + abs((int)ib) + abs((int)ic)) / 3000.0f;  /* mA→A, /3 */
+        float reduction = s_advance_slope * i_avg;
+        float base_deg = (float)s_advance_raw / 182.044f;
+        float eff_deg = base_deg - reduction;
+        if (eff_deg < 0.0f)   eff_deg = 0.0f;
+        if (eff_deg > 120.0f) eff_deg = 120.0f;
+        effective_adv = (uint16_t)(eff_deg * 182.044f);
+    }
+    uint16_t adv = s_angle + effective_adv;
 
     uint8_t idx_a = (uint8_t)(adv >> 8);
     uint8_t idx_b = (uint8_t)((adv + 43691U) >> 8);   /* -120° ≡ +240° */
@@ -247,4 +289,42 @@ uint16_t sinus_get_angle(void)
 bool sinus_is_running(void)
 {
     return s_running;
+}
+
+/* Stall detection for external reporting (read+clear). */
+bool sinus_get_and_clear_stall(void)
+{
+    bool s = s_stall_reported;
+    s_stall_reported = false;
+    return s;
+}
+
+uint32_t sinus_get_stall_count(void)
+{
+    return s_stall_count;
+}
+
+/* ── Przesunięcie fazowe ──────────────────────────────────── */
+void sinus_set_advance_deg(float deg)
+{
+    if (deg < 0.0f)   deg = 0.0f;
+    if (deg > 120.0f) deg = 120.0f;
+    s_advance_raw = (uint16_t)(deg * 182.044f);
+}
+
+float sinus_get_advance_deg(void)
+{
+    return (float)s_advance_raw / 182.044f;
+}
+
+void sinus_set_advance_slope(float deg_per_a)
+{
+    if (deg_per_a < 0.0f)  deg_per_a = 0.0f;
+    if (deg_per_a > 50.0f) deg_per_a = 50.0f;
+    s_advance_slope = deg_per_a;
+}
+
+float sinus_get_advance_slope(void)
+{
+    return s_advance_slope;
 }

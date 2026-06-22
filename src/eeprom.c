@@ -12,7 +12,7 @@
 #define EE_PAGE_ADDR    0x0800FC00U
 #define EE_PAGE_SIZE    1024U
 #define EE_MAGIC        0x4C48U   /* 'H' 'L' little-endian */
-#define EE_VERSION      1U
+#define EE_VERSION      2U
 
 /* CRC16/XMODEM (polynomial 0x1021). */
 static uint16_t crc16(const uint8_t *data, uint32_t len)
@@ -127,8 +127,11 @@ bool eeprom_load(eeprom_config_t *cfg)
     /* Skopiuj zawartość strony do struktury. */
     memcpy(cfg, (const void *)EE_PAGE_ADDR, sizeof(*cfg));
 
-    /* Walidacja magic + CRC. */
-    if (cfg->magic != EE_MAGIC || cfg->version != EE_VERSION) {
+    /* Walidacja magic + wersja (v1 lub v2). */
+    if (cfg->magic != EE_MAGIC) {
+        return false;
+    }
+    if (cfg->version != 1U && cfg->version != 2U) {
         return false;
     }
 

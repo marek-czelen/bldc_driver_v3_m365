@@ -6,6 +6,7 @@
 #include "eeprom.h"
 #include "sinus.h"
 #include "adc.h"
+#include "uart.h"
 
 /* ------------------------------------------------------------------ */
 /* Tablice komutacji 6-step (indeks = stan Halla 0..7).               */
@@ -49,6 +50,12 @@ static volatile uint32_t s_last_hall_us = 0;
 static float s_pi_integ = 0.0f;
 static const float PI_KP = 0.05f;   /* [duty/rpm]  — dostrój */
 static const float PI_KI = 0.10f;   /* [duty/(rpm*s)] — dostrój */
+
+/* ── Stall detection / reporting ───────────────────────────── */
+static volatile uint32_t s_stall_ticks = 0;        /* licznik 1ms bez Halla */
+static uint32_t s_last_stall_report_ms = 0;
+#define STALL_REPORT_INTERVAL_MS  1000U  /* max 1 raport na sekundę */
+#define STALL_TICK_THRESHOLD      200U   /* ~200ms bez Halla → stall */
 
 /* ------------------------------------------------------------------ */
 static inline uint16_t duty_pct_to_raw(float pct)
@@ -98,12 +105,13 @@ void motor_init(void)
     s_duty  = 0;
     s_target_rpm = 0.0f;
     s_rpm = 0.0f;
+    s_stall_ticks = 0;
     load_default_tables();
+    sinus_init();          /* ustaw domyślne 60° / slope=0 */
 
-    /* Spróbuj wczytać zapisaną konfigurację Halla z EEPROM.
-     * Jeśli jest poprawna — nadpisuje domyślną tablicę. */
+    /* Spróbuj wczytać zapisaną konfigurację z EEPROM.
+     * Jeśli poprawna — nadpisuje tablice Halla, advance, slope. */
     motor_config_load();
-    sinus_init();
     pwm_coast();
 
     /* Kalibracja offsetu prądu (mostek wyłączony → zero prądu). */
@@ -128,6 +136,7 @@ void motor_start(void)
     s_state = MSTATE_RUN;
     s_last_hall_us = micros();
     s_hall = hall_read();
+    s_stall_ticks = 0;
     hw_commutate(s_hall);
 }
 
@@ -304,8 +313,10 @@ bool motor_config_save(void)
 {
     eeprom_config_t cfg;
     cfg.magic      = 0x4C48U;  /* 'H' 'L' */
-    cfg.version    = 1U;
+    cfg.version    = 2U;
     cfg.pole_pairs = MOTOR_POLE_PAIRS;
+    cfg.phase_advance_deg10 = (uint16_t)(sinus_get_advance_deg() * 10.0f);
+    cfg.phase_advance_slope = (uint16_t)(sinus_get_advance_slope() * 100.0f);  /* deg/A * 100 */
 
     /* Kopiujemy stany hall=1..6 (indeksy 0 i 7 zawsze niepoprawne). */
     for (uint8_t h = 1; h <= 6; h++) {
@@ -343,14 +354,26 @@ bool motor_config_load(void)
     s_hi[DIR_REV][7] = s_lo[DIR_REV][7] = -1;
 
     s_learned = true;
+
+    /* Odtwórz przesunięcie fazowe SINUS z EEPROM. */
+    if (cfg.phase_advance_deg10 > 0 && cfg.phase_advance_deg10 <= 1200) {
+        sinus_set_advance_deg((float)cfg.phase_advance_deg10 / 10.0f);
+    }
+    /* Slope: v1 EEPROM ma 0 w tym polu (nieużywane), v2 ma wartość. */
+    if (cfg.phase_advance_slope <= 5000) {
+        sinus_set_advance_slope((float)cfg.phase_advance_slope / 100.0f);
+    }
+
     return true;
 }
 
 bool motor_config_erase(void)
 {
     eeprom_erase();
-    /* Przywróć domyślną tablicę. */
+    /* Przywróć domyślną tablicę i parametry SINUS. */
     load_default_tables();
+    sinus_set_advance_deg(60.0f);
+    sinus_set_advance_slope(0.0f);
     s_learned = false;
     return true;
 }
@@ -389,6 +412,26 @@ void motor_set_dir(motor_dir_t dir)
             hw_commutate(hall_read());
         }
     }
+}
+
+void motor_set_advance_deg(float deg)
+{
+    sinus_set_advance_deg(deg);
+}
+
+float motor_get_advance_deg(void)
+{
+    return sinus_get_advance_deg();
+}
+
+void motor_set_advance_slope(float deg_per_a)
+{
+    sinus_set_advance_slope(deg_per_a);
+}
+
+float motor_get_advance_slope(void)
+{
+    return sinus_get_advance_slope();
 }
 
 void motor_set_duty_pct(float pct)
@@ -448,6 +491,9 @@ void motor_on_hall(void)
         return;
     }
 
+    /* BLOCK: każde zbocze Halla resetuje licznik stall. */
+    s_stall_ticks = 0;
+
     /* Pomiar prędkości: czas między zboczami (1 zbocze = 60° elektr.). */
     uint32_t now = micros();
     uint32_t dt  = now - s_last_hall_us;
@@ -465,6 +511,35 @@ void motor_on_hall(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Raportowanie zdarzeń (stall) — wołane z głównej pętli.             */
+/* ------------------------------------------------------------------ */
+void motor_poll_events(void)
+{
+    if (s_state != MSTATE_RUN) return;
+
+    bool stall = false;
+    if (s_mode == MODE_SINUS) {
+        stall = sinus_get_and_clear_stall();
+    } else {
+        /* BLOCK: stall gdy licznik 1ms bez Halla przekroczy próg. */
+        stall = (s_stall_ticks > STALL_TICK_THRESHOLD);
+    }
+
+    if (stall) {
+        uint32_t now = millis();
+        if ((now - s_last_stall_report_ms) >= STALL_REPORT_INTERVAL_MS) {
+            s_last_stall_report_ms = now;
+            int16_t ia = adc_read_current_ma(ADC_CH_IA);
+            int16_t ib = adc_read_current_ma(ADC_CH_IB);
+            int16_t ic = adc_read_current_ma(ADC_CH_IC);
+            uart_printf("E STALL md=%d d=%d rpm=%d ia=%d ib=%d ic=%d\r\n",
+                (int)s_mode, (int)motor_get_duty_pct(), (int)motor_get_rpm(),
+                (int)ia, (int)ib, (int)ic);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Pętla regulacji 1 kHz.                                             */
 /* ------------------------------------------------------------------ */
 void motor_tick_1ms(void)
@@ -475,13 +550,22 @@ void motor_tick_1ms(void)
         return;
     }
 
-    /* Wykrycie zatrzymania -> rpm = 0. */
-    if ((micros() - s_last_hall_us) > HALL_STALL_US) {
+    /* BLOCK: zliczaj ticki bez Halla, zeruj RPM przy przeciągnięciu. */
+    s_stall_ticks++;
+    if (s_stall_ticks > (HALL_STALL_US / 1000U)) {
         s_rpm = 0.0f;
     }
 
     if (s_state != MSTATE_RUN) {
         return;
+    }
+
+    /* ── BLOCK: stall recovery — wymuś krok komutacji ── */
+    if (s_stall_ticks > (HALL_STALL_US / 1000U)) {
+        uint8_t h = hall_read();
+        if (h >= 1 && h <= 6) {
+            hw_commutate(h);
+        }
     }
 
     if (s_ctrl == CTRL_SPEED) {
