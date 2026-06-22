@@ -76,6 +76,7 @@
 #define MOTOR_POLE_PAIRS   15U
 /* Po jakim czasie bez zbocza Halla uznajemy, że silnik stoi (us).   */
 #define HALL_STALL_US      300000UL
+#define HALL_TIMEOUT_MS    200U        /* timeout Halla w ms (dla SINUS) */
 
 /* Uczenie sekwencji Halla (komenda L[%]) */
 #define LEARN_DUTY_PCT     30.0f      /* domyślne duty podczas uczenia  */

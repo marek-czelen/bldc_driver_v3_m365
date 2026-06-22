@@ -4,6 +4,7 @@
 #include "hall.h"
 #include "timebase.h"
 #include "eeprom.h"
+#include "sinus.h"
 
 /* ------------------------------------------------------------------ */
 /* Tablice komutacji 6-step (indeks = stan Halla 0..7).               */
@@ -101,21 +102,27 @@ void motor_init(void)
     /* Spróbuj wczytać zapisaną konfigurację Halla z EEPROM.
      * Jeśli jest poprawna — nadpisuje domyślną tablicę. */
     motor_config_load();
-
+    sinus_init();
     pwm_coast();
 }
 
 void motor_start(void)
 {
+    if (s_mode == MODE_SINUS) {
+        s_pi_integ = 0.0f;
+        s_state = MSTATE_RUN;
+        s_last_hall_us = micros();
+        s_hall = hall_read();
+        sinus_start();
+        return;
+    }
     if (s_mode != MODE_BLOCK) {
-        /* SINUS jeszcze niezaimplementowany. */
         return;
     }
     s_pi_integ = 0.0f;
     s_state = MSTATE_RUN;
     s_last_hall_us = micros();
     s_hall = hall_read();
-    /* Wymuś pierwszą komutację (silnik stoi -> brak zbocza Halla). */
     hw_commutate(s_hall);
 }
 
@@ -123,6 +130,7 @@ void motor_stop(void)
 {
     s_state = MSTATE_IDLE;
     s_duty  = 0;
+    sinus_stop();
     pwm_coast();
 }
 
@@ -369,7 +377,12 @@ void motor_set_dir(motor_dir_t dir)
 {
     s_dir = dir;
     if (s_state == MSTATE_RUN) {
-        hw_commutate(hall_read());
+        if (s_mode == MODE_SINUS) {
+            /* SINUS: zmiana kierunku = odwrócenie kierunku narastania kąta
+             * (realizowane wewnętrznie przez sinus_hall_edge i estymator). */
+        } else {
+            hw_commutate(hall_read());
+        }
     }
 }
 
@@ -378,7 +391,11 @@ void motor_set_duty_pct(float pct)
     s_ctrl = CTRL_DUTY;
     s_duty = duty_pct_to_raw(pct);
     if (s_state == MSTATE_RUN) {
-        hw_commutate(hall_read());
+        if (s_mode == MODE_SINUS) {
+            sinus_set_amplitude(pct);
+        } else {
+            hw_commutate(hall_read());
+        }
     }
 }
 
@@ -393,7 +410,13 @@ motor_mode_t  motor_get_mode(void)  { return s_mode; }
 motor_state_t motor_get_state(void) { return s_state; }
 motor_dir_t   motor_get_dir(void)   { return s_dir; }
 ctrl_mode_t   motor_get_ctrl(void)  { return s_ctrl; }
-float         motor_get_rpm(void)   { return s_rpm; }
+float         motor_get_rpm(void)
+{
+    if (s_mode == MODE_SINUS) {
+        return sinus_get_rpm();
+    }
+    return s_rpm;
+}
 uint8_t       motor_get_hall(void)  { return s_hall; }
 
 float motor_get_duty_pct(void)
@@ -409,16 +432,19 @@ void motor_on_hall(void)
     uint8_t h = hall_read();
     s_hall = h;
 
+    if (s_mode == MODE_SINUS) {
+        sinus_hall_edge(h);
+        return;
+    }
+
     /* Pomiar prędkości: czas między zboczami (1 zbocze = 60° elektr.). */
     uint32_t now = micros();
     uint32_t dt  = now - s_last_hall_us;
     s_last_hall_us = now;
 
     if (dt > 0U) {
-        /* obr/s elektr. = 1 / (6 * dt[s]); mech_rpm = elec*60/pole_pairs */
         float erev_per_s = 1000000.0f / (6.0f * (float)dt);
         float rpm = erev_per_s * 60.0f / (float)MOTOR_POLE_PAIRS;
-        /* filtr dolnoprzepustowy */
         s_rpm = s_rpm * 0.7f + rpm * 0.3f;
     }
 
@@ -432,6 +458,12 @@ void motor_on_hall(void)
 /* ------------------------------------------------------------------ */
 void motor_tick_1ms(void)
 {
+    /* W SINUSIE główna pętla sinusa wykonuje estymację + PWM. */
+    if (s_mode == MODE_SINUS) {
+        sinus_update();
+        return;
+    }
+
     /* Wykrycie zatrzymania -> rpm = 0. */
     if ((micros() - s_last_hall_us) > HALL_STALL_US) {
         s_rpm = 0.0f;
@@ -442,8 +474,9 @@ void motor_tick_1ms(void)
     }
 
     if (s_ctrl == CTRL_SPEED) {
+        float cur_rpm = motor_get_rpm();
         const float dt_s = 0.001f;
-        float err = s_target_rpm - s_rpm;
+        float err = s_target_rpm - cur_rpm;
 
         s_pi_integ += err * dt_s;
         /* ograniczenie całki (anti-windup) */
@@ -456,6 +489,11 @@ void motor_tick_1ms(void)
         if (out > (float)PWM_DUTY_MAX)     out = (float)PWM_DUTY_MAX;
 
         s_duty = (uint16_t)out;
-        hw_commutate(s_hall);
+
+        if (s_mode == MODE_SINUS) {
+            sinus_set_amplitude((float)out * 100.0f / (float)PWM_DUTY_MAX);
+        } else {
+            hw_commutate(s_hall);
+        }
     }
 }

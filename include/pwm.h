@@ -3,6 +3,7 @@
 #define PWM_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 /* Identyfikatory faz */
 typedef enum {
@@ -13,6 +14,9 @@ typedef enum {
 
 /* Inicjalizacja TIM1 z preload przez COM (CCPC=1). */
 void pwm_init(void);
+
+/* Przełącz tryb preload: true = COM (BLOCK), false = UPDATE (SINUS). */
+void pwm_set_ccpc(bool on);
 
 /* -------- Tryb sprzętowy (RUN) -------- */
 

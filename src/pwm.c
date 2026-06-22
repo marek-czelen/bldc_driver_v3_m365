@@ -162,3 +162,12 @@ void pwm_coast(void)
     TIM1->CCER = 0;
     TIM1->EGR = TIM_EGR_COMG;
 }
+
+void pwm_set_ccpc(bool on)
+{
+    if (on) {
+        TIM1->CR2 |= TIM_CR2_CCPC;
+    } else {
+        TIM1->CR2 &= ~TIM_CR2_CCPC;
+    }
+}
